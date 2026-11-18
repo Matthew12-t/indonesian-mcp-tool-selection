@@ -1,0 +1,865 @@
+# 00 - Membangun dataset final (tools_id.json, queries.json) di Kaggle dari definisi yang sama dengan
+# dataset/build_checksheet.py, lalu memverifikasi hash-nya sama dengan versi yang sudah divalidasi.
+# Input: output kernel mcp-tool-snapshot (tools_en.json).
+
+import copy
+import glob
+import hashlib
+import json
+import os
+import shutil
+import sys
+
+OUT = os.environ.get("OUT_DIR", "/kaggle/working")
+SNAPSHOT = os.environ.get("SNAPSHOT") or glob.glob("/kaggle/input/**/tools_en.json", recursive=True)[0]
+EXPECTED_SHA256 = {
+    "tools_en.json": "f5d9f8f310e3f07e802c205cf3b8afefc4a5f3fb166d49bb81394a7560c71dc3",
+    "tools_id.json": "ff889b9f44f4fdedfc962387cd84bd08438ae3ac1f1eea39c95323621604bf2d",
+    "queries.json": "81b65130afb0dcb366593a65c148e9bc81f0c6754447f9d630ddbf3e8e5794a3",
+}
+
+WORKSPACE = "/workspace"
+REPO = "/workspace/app"
+
+# ---------------------------------------------------------------------------
+# 1. Terjemahan deskripsi. Kunci: "tool|param" ("tool|" = deskripsi tool).
+#    Nama tool, nama parameter, nilai contoh, dan token kode tidak diterjemahkan.
+# ---------------------------------------------------------------------------
+P = "Path absolut, atau relatif terhadap direktori yang diizinkan; path harus mengarah ke lokasi di dalam direktori yang diizinkan."
+ONLY = "Hanya berfungsi di dalam direktori yang diizinkan."
+EXCL = ("Pola untuk entri yang akan dikecualikan beserta isinya, dicocokkan dengan path setiap entri relatif terhadap path. "
+        "Pola tanpa '*' cocok dengan nama tersebut di kedalaman mana pun ('node_modules' mengecualikan setiap direktori "
+        "node_modules); pola dengan '*' adalah glob yang dicocokkan apa adanya, dan pola yang diakhiri '/**' juga "
+        "mengecualikan direktori yang disebutkannya.")
+OBSLIM = ("Kembalikan paling banyak sejumlah ini observasi per entitas (yang pertama, sesuai urutan penambahannya) dan "
+          "tambahkan total observasi setiap entitas sebagai observationCount. Gunakan 0 untuk nama, tipe, dan jumlah saja: "
+          "gambaran ringkas yang murah untuk graf yang besar, setelah itu open_nodes dapat membaca secara lengkap entitas "
+          "yang Anda perlukan. Kosongkan untuk mengembalikan semua observasi.")
+TS_EX = ("Menerima: format ISO 8601 (misalnya, '2024-01-15T14:30:25'), tanggal relatif (misalnya, '2 weeks ago', "
+         "'yesterday'), atau tanggal absolut (misalnya, '2024-01-15', 'Jan 15 2024')")
+TZ_OPT = "Opsional: jika dikosongkan, bawaannya adalah zona waktu lokal server, 'Asia/Jakarta'."
+TZ = f"Nama zona waktu IANA (misalnya, 'America/New_York', 'Europe/London'). {TZ_OPT}"
+
+ID = {
+    # ---- filesystem ----
+    "read_file|": "Membaca seluruh isi file sebagai teks. USANG: Gunakan read_text_file sebagai gantinya.",
+    "read_file|path": f"File yang akan dibaca sebagai teks. {P}",
+    "read_file|tail": "Jika diberikan, hanya mengembalikan N baris terakhir dari file",
+    "read_file|head": "Jika diberikan, hanya mengembalikan N baris pertama dari file",
+    "read_text_file|": (
+        "Membaca seluruh isi file dari sistem file sebagai teks. Menangani berbagai encoding teks dan memberikan pesan "
+        "galat yang terperinci jika file tidak dapat dibaca. Gunakan tool ini ketika Anda perlu memeriksa isi satu file. "
+        "Gunakan parameter 'head' untuk membaca hanya N baris pertama dari file, atau parameter 'tail' untuk membaca hanya "
+        f"N baris terakhir dari file. Memproses file sebagai teks apa pun ekstensinya. {ONLY}"),
+    "read_text_file|path": f"File yang akan dibaca sebagai teks. {P}",
+    "read_text_file|tail": "Jika diberikan, hanya mengembalikan N baris terakhir dari file",
+    "read_text_file|head": "Jika diberikan, hanya mengembalikan N baris pertama dari file",
+    "read_media_file|": (
+        "Membaca file dan mengembalikannya sebagai blok konten berenkode base64 beserta tipe MIME-nya. File gambar dan "
+        "audio dikembalikan sebagai konten gambar/audio; jenis file lainnya dikembalikan sebagai resource tersemat. "
+        f"{ONLY}"),
+    "read_media_file|path": f"File gambar, audio, atau file lain yang akan dibaca sebagai base64. {P}",
+    "read_multiple_files|": (
+        "Membaca isi beberapa file sekaligus. Cara ini lebih efisien daripada membaca file satu per satu ketika Anda perlu "
+        "menganalisis atau membandingkan beberapa file. Isi setiap file dikembalikan bersama path-nya sebagai acuan. "
+        f"Kegagalan membaca satu file tidak akan menghentikan seluruh operasi. {ONLY}"),
+    "read_multiple_files|paths": (
+        "Array berisi path file yang akan dibaca. Setiap path harus berupa string yang mengarah ke file yang valid di "
+        "dalam direktori yang diizinkan."),
+    "write_file|": (
+        "Membuat file baru atau menimpa seluruh isi file yang sudah ada dengan konten baru. Gunakan dengan hati-hati karena "
+        "tool ini akan menimpa file yang sudah ada tanpa peringatan. Menangani konten teks dengan encoding yang tepat. "
+        f"{ONLY}"),
+    "write_file|path": f"File yang akan dibuat, atau ditimpa jika sudah ada; direktori induknya harus sudah ada. {P}",
+    "write_file|content": "Seluruh teks yang akan menjadi isi file, menggantikan isi sebelumnya",
+    "append_file|": (
+        "Menambahkan teks ke akhir file, dan membuat file tersebut jika belum ada. Isi yang sudah ada tidak pernah diubah "
+        "atau diganti. Teks ditambahkan persis seperti yang diberikan, tanpa tambahan baris baru sebelum atau sesudahnya, "
+        f"jadi akhiri teks dengan baris baru jika penambahan berikutnya harus dimulai di baris baru. {ONLY}"),
+    "append_file|path": f"File yang akan ditambahi teks; file akan dibuat jika belum ada. {P}",
+    "append_file|content": (
+        "Teks yang akan ditambahkan, persis seperti yang diberikan. Tidak ada baris baru yang ditambahkan: akhiri dengan "
+        "\\n jika penambahan berikutnya harus dimulai di baris baru."),
+    "edit_file|": (
+        "Melakukan pengeditan berbasis baris pada file teks. Pengeditan diterapkan secara berurutan, masing-masing pada "
+        "hasil pengeditan sebelumnya, dan masing-masing mengganti kecocokan pertama dari oldText dengan newText. oldText "
+        "harus sama persis dengan teks di file, kecuali bahwa akhir baris (LF atau CRLF) tidak pernah berpengaruh dan, jika "
+        "tidak ada kecocokan persis, rangkaian baris utuh dianggap cocok jika setiap barisnya sama setelah spasi di awal "
+        "dan akhir baris diabaikan (newText kemudian mengikuti indentasi file). Spasi di dalam baris harus sama. Jika ada "
+        "pengeditan yang tidak menemukan kecocokan, tidak ada yang ditulis dan pesan galat menampilkan baris-baris file "
+        "yang paling mirip, lengkap dengan nomornya, untuk disalin menjadi oldText. Mengembalikan diff bergaya git yang "
+        f"menunjukkan perubahan yang dibuat. {ONLY}"),
+    "edit_file|path": f"File teks yang akan diedit. {P}",
+    "edit_file|edits": (
+        "Penggantian yang akan dilakukan, diterapkan secara berurutan, masing-masing pada hasil penggantian sebelumnya. "
+        "Jika ada satu saja yang tidak menemukan kecocokan, tidak ada yang ditulis."),
+    "edit_file|dryRun": "Pratinjau perubahan menggunakan format diff bergaya git",
+    "create_directory|": (
+        "Membuat direktori baru atau memastikan sebuah direktori ada. Dapat membuat beberapa direktori bertingkat dalam "
+        "satu operasi. Jika direktori sudah ada, operasi ini akan berhasil tanpa pemberitahuan. Sangat cocok untuk "
+        f"menyiapkan struktur direktori proyek atau memastikan path yang diperlukan tersedia. {ONLY}"),
+    "create_directory|path": (
+        "Direktori yang akan dibuat, beserta direktori induk yang belum ada; direktori yang sudah ada dibiarkan apa "
+        f"adanya. {P}"),
+    "list_directory|": (
+        "Menampilkan daftar file dan direktori yang berada langsung di dalam sebuah path, masing-masing ditandai [FILE] "
+        "atau [DIR]. Gunakan untuk melihat isi sebuah direktori; jika Anda juga memerlukan ukuran setiap entri atau ingin "
+        "entri diurutkan berdasarkan ukuran, gunakan list_directory_with_sizes, dan untuk tampilan rekursif gunakan "
+        f"directory_tree. Mengembalikan satu baris per entri. {ONLY}"),
+    "list_directory|path": f"Direktori yang akan ditampilkan isinya. {P}",
+    "list_directory_with_sizes|": (
+        "Menampilkan daftar file dan direktori yang berada langsung di dalam sebuah path beserta ukuran setiap file, "
+        "ditandai [FILE] atau [DIR], diurutkan berdasarkan nama atau berdasarkan ukuran dari yang terbesar (sortBy). "
+        "Gunakan ketika ukuran penting, misalnya untuk mencari file terbesar; untuk nama saja, gunakan list_directory, "
+        f"yang mengembalikan teks lebih sedikit. Mengembalikan satu baris per entri, diikuti totalnya. {ONLY}"),
+    "list_directory_with_sizes|path": f"Direktori yang akan ditampilkan isinya. {P}",
+    "list_directory_with_sizes|sortBy": "Urutkan entri berdasarkan nama atau ukuran",
+    "directory_tree|": (
+        "Mendapatkan tampilan pohon rekursif dari file dan direktori dalam bentuk struktur JSON. Setiap entri memuat "
+        "'name', 'type' (file/directory), dan 'children' untuk direktori. File tidak memiliki array children, sedangkan "
+        "direktori selalu memiliki array children (yang bisa kosong), kecuali pada tingkat terakhir ketika 'depth' "
+        "membatasi pohon: direktori tersebut tidak dibaca dan tidak memiliki array children. Output diformat dengan "
+        f"indentasi 2 spasi agar mudah dibaca. {ONLY}"),
+    "directory_tree|path": f"Direktori yang menjadi akar pohon. {P}",
+    "directory_tree|excludePatterns": EXCL,
+    "directory_tree|depth": (
+        "Berapa tingkat yang akan ditelusuri: 1 hanya menampilkan entri yang berada langsung di dalam path. Direktori pada "
+        "tingkat terakhir tidak memiliki array children. Kosongkan untuk seluruh pohon."),
+    "move_file|": (
+        "Memindahkan atau mengganti nama file dan direktori. Dapat memindahkan file antardirektori sekaligus mengganti "
+        "namanya dalam satu operasi. Jika tujuan sudah ada, operasi akan gagal. Berfungsi lintas direktori dan dapat "
+        "digunakan untuk sekadar mengganti nama di dalam direktori yang sama. Sumber dan tujuan harus sama-sama berada di "
+        "dalam direktori yang diizinkan."),
+    "move_file|source": f"File atau direktori yang akan dipindahkan atau diganti namanya. {P}",
+    "move_file|destination": f"Path barunya, termasuk nama; belum boleh ada apa pun di lokasi tersebut. {P}",
+    "copy_file|": (
+        "Menyalin file ke lokasi baru, tanpa membaca isinya ke dalam percakapan. Menyalin satu file biasa, dengan "
+        "mempertahankan izin akses dan waktu modifikasinya; direktori tidak disalin. Jika tujuan sudah ada, operasi akan "
+        "gagal: tool ini tidak pernah menimpa. Sumber dan tujuan harus sama-sama berada di dalam direktori yang diizinkan."),
+    "copy_file|source": "File yang akan disalin",
+    "copy_file|destination": "Lokasi tempat salinan dibuat; belum boleh ada apa pun di lokasi tersebut",
+    "search_files|": (
+        "Mencari file dan direktori berdasarkan NAMA, bukan berdasarkan isi: tool ini tidak pernah membaca atau mencari di "
+        "dalam file. Tool ini menelusuri pohon di bawah 'path' dan mencocokkan pola glob dengan path setiap entri relatif "
+        "terhadap 'path' (peka huruf besar-kecil). Gunakan '*.ext' untuk mencocokkan entri yang berada langsung di bawah "
+        "'path', dan '**/*.ext' atau '**/name' untuk mencocokkan di kedalaman mana pun. Mengembalikan path lengkap dari "
+        "semua item yang cocok. Sangat berguna untuk mencari file ketika Anda tidak tahu lokasi pastinya. Hanya mencari di "
+        "dalam direktori yang diizinkan."),
+    "search_files|path": f"Direktori tempat pencarian dilakukan. {P}",
+    "search_files|pattern": (
+        "Glob yang dicocokkan dengan path setiap entri relatif terhadap path, tidak pernah dengan isinya: '*.ts' cocok "
+        "langsung di bawah path, '**/*.ts' di kedalaman mana pun."),
+    "search_files|excludePatterns": EXCL,
+    "get_file_info|": (
+        "Mengambil metadata terperinci tentang file atau direktori. Mengembalikan informasi lengkap termasuk ukuran, waktu "
+        "pembuatan, waktu terakhir diubah, izin akses, tipe, dan jumlah hard link. Tool ini sangat cocok untuk memahami "
+        f"karakteristik file tanpa membaca isinya. {ONLY}"),
+    "get_file_info|path": f"File atau direktori yang akan dideskripsikan. {P}",
+    "list_allowed_directories|": (
+        "Mengembalikan daftar direktori yang boleh diakses oleh server ini. Subdirektori di dalam direktori yang diizinkan "
+        "ini juga dapat diakses. Gunakan ini untuk mengetahui direktori mana saja beserta path di dalamnya yang tersedia "
+        "sebelum mencoba mengakses file."),
+    # ---- memory ----
+    "create_entities|": (
+        "Membuat beberapa entitas baru di graf pengetahuan. Entitas yang namanya sudah ada, atau yang mengulang entitas "
+        "sebelumnya dalam pemanggilan yang sama, akan dilewati dan observasinya tidak ditambahkan; hasilnya mencantumkan "
+        "nama-nama yang dilewati di `skipped`. Gunakan add_observations untuk menambahkan observasi ke entitas yang sudah "
+        "ada."),
+    "create_entities|entities": "Entitas yang akan dibuat, masing-masing dengan nama yang unik di dalam graf",
+    "create_relations|": (
+        "Membuat beberapa relasi baru antarentitas di graf pengetahuan. Relasi harus dinyatakan dalam kalimat aktif"),
+    "create_relations|relations": (
+        "Relasi yang akan dibuat. Kedua ujungnya harus merujuk ke entitas yang sudah ada; relasi yang sudah ada di graf "
+        "tidak ditambahkan lagi"),
+    "add_observations|": "Menambahkan observasi baru ke entitas yang sudah ada di graf pengetahuan",
+    "add_observations|observations": (
+        "Observasi yang akan ditambahkan, dikelompokkan per entitas. Setiap entitas harus sudah ada; observasi yang sudah "
+        "dimiliki entitas tersebut tidak ditambahkan lagi"),
+    "delete_entities|": (
+        "Menghapus entitas secara utuh dari graf pengetahuan, beserta setiap relasi yang mengarah ke atau dari entitas "
+        "tersebut dan semua observasinya. Gunakan hanya untuk menghapus sebuah entitas sepenuhnya; untuk menghapus "
+        "hubungan antara dua entitas tetapi mempertahankan keduanya, gunakan delete_relations, dan untuk menghapus fakta "
+        "dari sebuah entitas, gunakan delete_observations. Tidak dapat dibatalkan."),
+    "delete_entities|entityNames": "Array berisi nama entitas yang akan dihapus",
+    "delete_observations|": "Menghapus observasi tertentu dari entitas di graf pengetahuan",
+    "delete_observations|deletions": (
+        "Observasi yang akan dihapus, dikelompokkan per entitas, masing-masing dicocokkan berdasarkan teksnya yang persis"),
+    "delete_relations|": (
+        "Menghapus relasi tertentu (from, to, relationType) dari graf pengetahuan dan mempertahankan entitas yang "
+        "dihubungkannya. Setiap relasi harus sama persis dengan relasi yang ada pada ketiga field tersebut; jika ragu, "
+        "panggil open_nodes (atau search_nodes) terlebih dahulu untuk membaca relationType yang tersimpan. Gunakan untuk "
+        "menghapus hubungan antara dua entitas; untuk menghapus entitasnya sendiri, gunakan delete_entities. Tidak dapat "
+        "dibatalkan."),
+    "delete_relations|relations": "Array berisi relasi yang akan dihapus",
+    "read_graph|": (
+        "Membaca seluruh graf pengetahuan: setiap entitas beserta observasinya, dan setiap relasi. Hasilnya bertambah "
+        "besar seiring bertambahnya graf, jadi gunakan ini hanya ketika Anda memerlukan semuanya; utamakan search_nodes "
+        "untuk mencari entitas berdasarkan kata kunci dan open_nodes untuk membaca entitas yang namanya sudah Anda "
+        "ketahui."),
+    "read_graph|entityTypes": (
+        "Hanya kembalikan entitas yang entityType-nya termasuk salah satu dari nilai ini (harus sama persis), dan hanya "
+        "relasi yang menyentuh salah satu entitas tersebut. Kosongkan untuk mengembalikan semua entitas."),
+    "read_graph|observationLimit": OBSLIM,
+    "search_nodes|": (
+        "Mencari entitas di graf pengetahuan yang nama, tipe, atau observasinya mengandung kueri (tidak peka huruf "
+        "besar-kecil). Gunakan ini ketika Anda memiliki kata kunci, topik, atau sebagian nama, tetapi tidak mengetahui "
+        "nama entitas yang persis. Utamakan open_nodes jika Anda sudah mengetahui nama yang persis, dan gunakan read_graph "
+        "hanya jika Anda memerlukan seluruh graf. Mengembalikan entitas yang cocok dan setiap relasi yang menyentuh salah "
+        "satunya."),
+    "search_nodes|query": "Kueri pencarian yang dicocokkan dengan nama entitas, tipe, dan isi observasi",
+    "search_nodes|limit": (
+        "Kembalikan paling banyak sejumlah ini entitas yang cocok (kecocokan pertama, sesuai urutan penyimpanan), beserta "
+        "relasi yang menyentuhnya. Kosongkan untuk mengembalikan semua kecocokan."),
+    "search_nodes|observationLimit": OBSLIM,
+    "open_nodes|": (
+        "Mengambil entitas tertentu berdasarkan nama persisnya, beserta setiap relasi yang menyentuh salah satunya. "
+        "Gunakan ini ketika Anda sudah mengetahui namanya (dari percakapan, atau dari hasil search_nodes atau read_graph "
+        "sebelumnya); ini adalah cara termurah untuk membaca entitas yang dapat Anda sebutkan namanya. Utamakan "
+        "search_nodes jika Anda hanya memiliki kata kunci atau sebagian nama. Nama yang tidak ada akan dilewati."),
+    "open_nodes|names": "Array berisi nama entitas yang akan diambil",
+    "open_nodes|observationLimit": OBSLIM,
+    # ---- git ----
+    "git_status|": "Menampilkan status working tree",
+    "git_diff_unstaged|": "Menampilkan perubahan di direktori kerja yang belum di-stage",
+    "git_diff_staged|": "Menampilkan perubahan yang sudah di-stage untuk commit",
+    "git_diff|": ("Menampilkan perbedaan antar-branch atau antar-commit, atau dalam suatu rentang revisi "
+                  "(main..feature, main...feature)"),
+    "git_commit|": "Merekam perubahan ke repositori",
+    "git_add|": "Menambahkan isi file ke staging area",
+    "git_reset|": "Membatalkan stage semua perubahan yang sudah di-stage",
+    "git_log|": "Menampilkan log commit",
+    "git_log|max_count": "Jumlah maksimum commit yang ditampilkan. Minimal 1.",
+    "git_log|start_timestamp": f"Timestamp awal untuk menyaring commit. {TS_EX}",
+    "git_log|end_timestamp": f"Timestamp akhir untuk menyaring commit. {TS_EX}",
+    "git_create_branch|": "Membuat branch baru dari branch atau commit dasar yang bersifat opsional",
+    "git_create_branch|base_branch": (
+        "Branch, tag, atau SHA commit yang menjadi dasar pembuatan branch. Bawaannya adalah branch saat ini, atau commit "
+        "saat ini jika HEAD dalam keadaan detached"),
+    "git_checkout|": "Berpindah branch",
+    "git_merge|": (
+        "Menggabungkan sebuah branch ke branch saat ini. Hanya fast-forward kecuali fast_forward_only bernilai false; "
+        "menolak working tree yang kotor, dan membatalkan merge yang mengalami konflik sehingga repositori tidak berubah"),
+    "git_merge|source_branch": "Branch, tag, atau commit yang akan digabungkan ke branch saat ini",
+    "git_merge|fast_forward_only": (
+        "Hanya fast-forward, dan gagal jika kedua branch sudah bercabang. False mengizinkan merge commit"),
+    "git_show|": "Menampilkan isi sebuah commit, atau isi file atau direktori yang diberikan dalam bentuk <revision>:<path>",
+    "git_branch|": "Menampilkan daftar branch Git",
+    "git_branch|repo_path": "Path ke repositori Git.",
+    "git_branch|branch_type": (
+        "Apakah akan menampilkan branch lokal ('local'), branch remote ('remote'), atau semua branch ('all')."),
+    "git_branch|contains": (
+        "SHA commit yang harus dimuat oleh branch. Jangan isi parameter ini jika tidak ada SHA commit yang disebutkan"),
+    "git_branch|not_contains": (
+        "SHA commit yang TIDAK boleh dimuat oleh branch. Jangan isi parameter ini jika tidak ada SHA commit yang "
+        "disebutkan"),
+    "git_remote|": (
+        "Menampilkan daftar remote repositori beserta URL fetch dan push-nya, seperti `git remote -v`. Kredensial yang "
+        "tertanam di dalam URL ditampilkan sebagai <redacted>"),
+    "git_remote|repo_path": "Path ke repositori Git.",
+    # ---- fetch ----
+    "fetch|": (
+        "Mengambil sebuah URL dari internet dan secara opsional mengekstrak isinya sebagai markdown.\n\n"
+        "Meskipun awalnya Anda tidak memiliki akses internet, dan disarankan untuk menolak serta memberi tahu pengguna "
+        "tentang hal ini, tool ini sekarang memberi Anda akses internet. Sekarang Anda dapat mengambil informasi terbaru "
+        "dan memberi tahu pengguna tentang hal itu."),
+    "fetch|url": "URL yang akan diambil",
+    "fetch|max_length": "Jumlah maksimum karakter yang dikembalikan.",
+    "fetch|start_index": (
+        "Kembalikan output mulai dari indeks karakter ini, berguna jika pengambilan sebelumnya terpotong dan diperlukan "
+        "konteks tambahan."),
+    "fetch|raw": "Dapatkan konten HTML asli dari halaman yang diminta, tanpa penyederhanaan.",
+    "fetch|timeout_ms": (
+        "Berapa lama menunggu, dalam milidetik, untuk terhubung ke server dan untuk setiap pembacaan responsnya sebelum "
+        "menyerah. Naikkan nilainya untuk server yang lambat atau unduhan yang besar; turunkan agar cepat gagal."),
+    # ---- time ----
+    "get_current_time|": "Mendapatkan waktu saat ini di zona waktu tertentu",
+    "get_current_time|timezone": TZ,
+    "convert_time|": "Mengonversi waktu antarzona waktu",
+    "convert_time|source_timezone": f"Nama zona waktu IANA sumber (misalnya, 'America/New_York', 'Europe/London'). {TZ_OPT}",
+    "convert_time|time": "Waktu yang akan dikonversi dalam format 24 jam (HH:MM)",
+    "convert_time|target_timezone": f"Nama zona waktu IANA tujuan (misalnya, 'Asia/Tokyo', 'America/San_Francisco'). {TZ_OPT}",
+    "get_time_ago|": "Mendapatkan waktu sejumlah hari, jam, menit, dan detik yang lalu di zona waktu tertentu",
+    "get_time_ago|timezone": TZ,
+    "get_time_ago|days_ago": "Jumlah hari penuh sebelum sekarang",
+    "get_time_ago|hours_ago": "Jumlah jam penuh sebelum sekarang",
+    "get_time_ago|minutes_ago": "Jumlah menit penuh sebelum sekarang",
+    "get_time_ago|seconds_ago": "Jumlah detik penuh sebelum sekarang",
+}
+
+# ---------------------------------------------------------------------------
+# 2. Kueri. (kategori, tool_benar, tool_alternatif, parameter_dinilai, EN, ID, campuran)
+#    Nilai parameter boleh {"any_of": [...]}; None di any_of = boleh dikosongkan.
+# ---------------------------------------------------------------------------
+W, R = WORKSPACE, REPO
+JKT = {"any_of": ["Asia/Jakarta", None]}
+RT = ["read_file"]  # read_file usang, tetapi tetap menyelesaikan tugas -> hanya diterima pada skor longgar
+
+Q = [
+    # ===== filesystem =====
+    ("direct", "read_text_file", RT, {"path": f"{W}/notes.txt"},
+     f"Read the file {W}/notes.txt.", f"Baca file {W}/notes.txt.", f"Tolong read file {W}/notes.txt dong."),
+    ("direct", "read_text_file", RT, {"path": f"{R}/README.md"},
+     f"Show me what's inside {R}/README.md.", f"Tampilkan isi {R}/README.md.", f"Coba show isi file {R}/README.md."),
+    ("complex", "read_text_file", RT, {"path": f"{W}/logs/app.log", "head": 20},
+     f"Show only the first 20 lines of {W}/logs/app.log.", f"Tampilkan hanya 20 baris pertama dari {W}/logs/app.log.",
+     f"Aku cuma butuh first 20 lines dari {W}/logs/app.log."),
+    ("complex", "read_text_file", RT, {"path": f"{W}/logs/app.log", "tail": 50},
+     f"Show me the last 50 lines of {W}/logs/app.log.", f"Tampilkan 50 baris terakhir dari {W}/logs/app.log.",
+     f"Cek last 50 lines di {W}/logs/app.log dong."),
+    ("confusable", "read_text_file", RT, {"path": f"{W}/config.json"},
+     f"Open {W}/config.json so I can check the settings.",
+     f"Buka {W}/config.json supaya saya bisa memeriksa pengaturannya.",
+     f"Open {W}/config.json ya, aku mau cek setting-annya."),
+    ("direct", "read_media_file", [], {"path": f"{W}/images/logo.png"},
+     f"Load the image {W}/images/logo.png.", f"Muat gambar {W}/images/logo.png.", f"Load image {W}/images/logo.png dong."),
+    ("confusable", "read_media_file", [], {"path": f"{W}/images/diagram.jpg"},
+     f"I want to see the picture {W}/images/diagram.jpg.", f"Saya ingin melihat gambar {W}/images/diagram.jpg.",
+     f"Aku pengen lihat picture {W}/images/diagram.jpg."),
+    ("confusable", "read_media_file", [], {"path": f"{W}/audio/rekaman.mp3"},
+     f"Get the audio recording {W}/audio/rekaman.mp3.", f"Ambil rekaman audio {W}/audio/rekaman.mp3.",
+     f"Ambilin audio recording {W}/audio/rekaman.mp3 ya."),
+    ("direct", "read_multiple_files", ["read_text_file"], {"paths": [f"{W}/notes.txt", f"{W}/report.md"]},
+     f"Read both {W}/notes.txt and {W}/report.md.", f"Baca {W}/notes.txt dan {W}/report.md sekaligus.",
+     f"Read sekaligus {W}/notes.txt sama {W}/report.md."),
+    ("confusable", "read_multiple_files", ["read_text_file"], {"paths": [f"{W}/config.json", f"{W}/config.backup.json"]},
+     f"Compare the contents of {W}/config.json and {W}/config.backup.json.",
+     f"Bandingkan isi {W}/config.json dan {W}/config.backup.json.",
+     f"Compare isi {W}/config.json sama {W}/config.backup.json dong."),
+    ("confusable", "read_multiple_files", ["read_text_file"],
+     {"paths": [f"{W}/data/jan.csv", f"{W}/data/feb.csv", f"{W}/data/mar.csv"]},
+     f"Show me the contents of {W}/data/jan.csv, {W}/data/feb.csv, and {W}/data/mar.csv.",
+     f"Tampilkan isi {W}/data/jan.csv, {W}/data/feb.csv, dan {W}/data/mar.csv.",
+     f"Tampilin content {W}/data/jan.csv, {W}/data/feb.csv, sama {W}/data/mar.csv."),
+    ("direct", "write_file", [], {"path": f"{W}/todo.txt", "content": "Buy milk"},
+     f"Create a file {W}/todo.txt containing 'Buy milk'.", f"Buat file {W}/todo.txt berisi 'Buy milk'.",
+     f"Bikin file {W}/todo.txt isinya 'Buy milk'."),
+    ("confusable", "write_file", [], {"path": f"{W}/notes.txt", "content": "Meeting moved to Friday"},
+     f"Replace everything in {W}/notes.txt with the text 'Meeting moved to Friday'.",
+     f"Ganti seluruh isi {W}/notes.txt dengan teks 'Meeting moved to Friday'.",
+     f"Overwrite semua isi {W}/notes.txt jadi 'Meeting moved to Friday'."),
+    ("direct", "write_file", [], {"path": f"{W}/hello.txt", "content": "Hello world"},
+     f"Save the text 'Hello world' to a new file {W}/hello.txt.",
+     f"Simpan teks 'Hello world' ke file baru {W}/hello.txt.",
+     f"Save text 'Hello world' ke new file {W}/hello.txt."),
+    ("direct", "append_file", [], {"path": f"{W}/todo.txt", "content": "Call Budi"},
+     f"Add the line 'Call Budi' to the end of {W}/todo.txt.", f"Tambahkan baris 'Call Budi' di akhir {W}/todo.txt.",
+     f"Tambahin line 'Call Budi' di paling bawah {W}/todo.txt."),
+    ("confusable", "append_file", [], {"path": f"{W}/logs/backup.log", "content": "backup finished"},
+     f"Log the message 'backup finished' at the end of {W}/logs/backup.log without touching the existing entries.",
+     f"Catat pesan 'backup finished' di akhir {W}/logs/backup.log tanpa mengubah catatan yang sudah ada.",
+     f"Catat message 'backup finished' di akhir {W}/logs/backup.log, jangan ubah entry yang udah ada."),
+    ("confusable", "append_file", [], {"path": f"{W}/journal.md", "content": "Day 12: done"},
+     f"Keep what's already in {W}/journal.md and just add 'Day 12: done' after it.",
+     f"Biarkan isi {W}/journal.md yang sudah ada, cukup tambahkan 'Day 12: done' setelahnya.",
+     f"Isi {W}/journal.md yang lama biarin aja, just add 'Day 12: done' di belakangnya."),
+    ("direct", "edit_file", [], {"path": f"{W}/config.json",
+                                 "edits": [{"oldText": '"debug": true', "newText": '"debug": false'}]},
+     f'In {W}/config.json, change "debug": true to "debug": false.',
+     f'Di {W}/config.json, ubah "debug": true menjadi "debug": false.',
+     f'Di {W}/config.json, tolong change "debug": true jadi "debug": false.'),
+    ("confusable", "edit_file", [], {"path": f"{W}/report.md", "edits": [{"oldText": "recieve", "newText": "receive"}]},
+     f"Fix the typo 'recieve' to 'receive' in {W}/report.md.",
+     f"Perbaiki salah ketik 'recieve' menjadi 'receive' di {W}/report.md.",
+     f"Fix typo 'recieve' jadi 'receive' di {W}/report.md dong."),
+    ("complex", "edit_file", [], {"path": f"{R}/README.md", "edits": [{"oldText": "v1.0", "newText": "v1.1"}],
+                                  "dryRun": True},
+     f"Preview what would change if I replace 'v1.0' with 'v1.1' in {R}/README.md, but don't save it yet.",
+     f"Tampilkan pratinjau perubahan jika 'v1.0' diganti dengan 'v1.1' di {R}/README.md, tetapi jangan disimpan dulu.",
+     f"Preview dulu kalau 'v1.0' diganti 'v1.1' di {R}/README.md, tapi jangan di-save dulu."),
+    ("direct", "create_directory", [], {"path": f"{W}/archive"},
+     f"Create a folder {W}/archive.", f"Buat folder {W}/archive.", f"Bikinin folder {W}/archive."),
+    ("complex", "create_directory", [], {"path": f"{W}/projects/2026/q4/reports"},
+     f"Make the nested folders {W}/projects/2026/q4/reports.", f"Buat folder bertingkat {W}/projects/2026/q4/reports.",
+     f"Bikin nested folder {W}/projects/2026/q4/reports."),
+    ("confusable", "create_directory", [], {"path": f"{W}/output"},
+     f"Make sure the directory {W}/output exists before we save anything.",
+     f"Pastikan direktori {W}/output ada sebelum kita menyimpan apa pun.",
+     f"Make sure directory {W}/output udah ada sebelum kita save apa-apa."),
+    ("direct", "list_directory", [], {"path": f"{W}/data"},
+     f"What's in the {W}/data folder?", f"Apa saja isi folder {W}/data?", f"Folder {W}/data isinya apa aja?"),
+    ("confusable", "list_directory", [], {"path": W},
+     f"List the files directly inside {W}.", f"Tampilkan daftar file yang ada langsung di dalam {W}.",
+     f"List file yang ada langsung di {W} dong."),
+    ("confusable", "list_directory", [], {"path": f"{W}/images"},
+     f"Show me the names of everything in {W}/images, I don't need sizes.",
+     f"Tampilkan nama semua isi {W}/images, saya tidak perlu ukurannya.",
+     f"Show nama semua item di {W}/images, size-nya gak perlu."),
+    ("direct", "list_directory_with_sizes", [], {"path": f"{W}/data"},
+     f"List the files in {W}/data with their sizes.", f"Tampilkan daftar file di {W}/data beserta ukurannya.",
+     f"List file di {W}/data plus size-nya."),
+    ("complex", "list_directory_with_sizes", [], {"path": f"{W}/logs", "sortBy": "size"},
+     f"Which files in {W}/logs are the biggest? Sort them by size.",
+     f"File mana di {W}/logs yang paling besar? Urutkan berdasarkan ukuran.",
+     f"File apa di {W}/logs yang paling gede? Sort by size ya."),
+    ("confusable", "list_directory_with_sizes", [], {"path": f"{W}/images"},
+     f"How much space does each file in {W}/images take up?",
+     f"Berapa besar ruang yang dipakai setiap file di {W}/images?",
+     f"Tiap file di {W}/images makan space berapa?"),
+    ("direct", "directory_tree", [], {"path": R},
+     f"Show the full folder structure of {R} as a tree.",
+     f"Tampilkan seluruh struktur folder {R} dalam bentuk tree.",
+     f"Show full struktur folder {R} dalam bentuk tree."),
+    ("complex", "directory_tree", [], {"path": R, "excludePatterns": ["node_modules"]},
+     f"Give me the directory tree of {R} but skip node_modules.",
+     f"Berikan tree direktori {R}, tetapi lewati node_modules.",
+     f"Kasih directory tree {R} tapi skip node_modules."),
+    ("complex", "directory_tree", [], {"path": f"{W}/projects", "depth": 2},
+     f"Show the tree of {W}/projects, only two levels deep.",
+     f"Tampilkan tree {W}/projects, cukup sampai dua tingkat.",
+     f"Show tree {W}/projects, two levels aja."),
+    ("confusable", "directory_tree", [], {"path": f"{W}/data"},
+     f"Show me all subfolders and files under {W}/data recursively.",
+     f"Tampilkan semua subfolder dan file di bawah {W}/data secara rekursif.",
+     f"Tampilin semua subfolder dan file di {W}/data secara recursive."),
+    ("direct", "move_file", [], {"source": f"{W}/notes.txt", "destination": f"{W}/notes-old.txt"},
+     f"Rename {W}/notes.txt to {W}/notes-old.txt.", f"Ganti nama {W}/notes.txt menjadi {W}/notes-old.txt.",
+     f"Rename {W}/notes.txt jadi {W}/notes-old.txt."),
+    ("confusable", "move_file", [], {"source": f"{W}/report.md", "destination": f"{W}/archive/report.md"},
+     f"Move {W}/report.md into {W}/archive/report.md.", f"Pindahkan {W}/report.md ke {W}/archive/report.md.",
+     f"Move {W}/report.md ke {W}/archive/report.md ya."),
+    ("confusable", "move_file", [], {"source": f"{W}/data/sales.csv", "destination": f"{W}/archive/sales.csv"},
+     f"Put {W}/data/sales.csv in the archive folder as {W}/archive/sales.csv; it shouldn't stay in data.",
+     f"Taruh {W}/data/sales.csv di folder arsip sebagai {W}/archive/sales.csv; file itu tidak boleh tetap ada di data.",
+     f"Taruh {W}/data/sales.csv di archive jadi {W}/archive/sales.csv, jangan sampai masih ada di data."),
+    ("direct", "copy_file", [], {"source": f"{W}/config.json", "destination": f"{W}/config.backup.json"},
+     f"Make a copy of {W}/config.json at {W}/config.backup.json.",
+     f"Buat salinan {W}/config.json di {W}/config.backup.json.",
+     f"Bikin copy {W}/config.json ke {W}/config.backup.json."),
+    ("confusable", "copy_file", [], {"source": f"{W}/report.md", "destination": f"{W}/archive/report-copy.md"},
+     f"Duplicate {W}/report.md to {W}/archive/report-copy.md and keep the original where it is.",
+     f"Duplikat {W}/report.md ke {W}/archive/report-copy.md dan biarkan file aslinya di tempatnya.",
+     f"Duplicate {W}/report.md ke {W}/archive/report-copy.md, yang original biarin di situ."),
+    ("confusable", "copy_file", [], {"source": f"{W}/data/sales.csv", "destination": f"{W}/data/sales-2026-11.csv"},
+     f"Back up {W}/data/sales.csv as {W}/data/sales-2026-11.csv.",
+     f"Cadangkan {W}/data/sales.csv sebagai {W}/data/sales-2026-11.csv.",
+     f"Backup-in {W}/data/sales.csv jadi {W}/data/sales-2026-11.csv."),
+    ("direct", "search_files", [], {"path": W, "pattern": "**/*.pdf"},
+     f"Find all PDF files anywhere under {W}.", f"Cari semua file PDF di mana pun di bawah {W}.",
+     f"Cariin semua file PDF di mana aja di {W}."),
+    ("confusable", "search_files", [], {"path": W, "pattern": "**/budget.xlsx"},
+     f"Where is the file called budget.xlsx? It's somewhere in {W}.",
+     f"Di mana file bernama budget.xlsx? Letaknya di suatu tempat di {W}.",
+     f"File budget.xlsx itu di mana ya? Pokoknya somewhere di {W}."),
+    ("complex", "search_files", [], {"path": R, "pattern": "**/*.py", "excludePatterns": ["venv"]},
+     f"Find all .py files under {R}, excluding the venv folder.",
+     f"Cari semua file .py di bawah {R}, kecuali folder venv.",
+     f"Find semua file .py di {R}, exclude folder venv."),
+    ("confusable", "search_files", [], {"path": f"{W}/data", "pattern": "*.csv"},
+     f"Look for any CSV files directly in {W}/data.", f"Cari file CSV yang ada langsung di {W}/data.",
+     f"Cari file CSV yang langsung ada di {W}/data dong."),
+    ("direct", "get_file_info", [], {"path": f"{W}/report.md"},
+     f"When was {W}/report.md last modified?", f"Kapan {W}/report.md terakhir diubah?",
+     f"{W}/report.md terakhir di-modify kapan?"),
+    ("confusable", "get_file_info", [], {"path": f"{W}/data/sales.csv"},
+     f"What are the permissions and size of {W}/data/sales.csv?",
+     f"Apa izin akses dan ukuran {W}/data/sales.csv?",
+     f"Permission sama size {W}/data/sales.csv berapa?"),
+    ("confusable", "get_file_info", [], {"path": f"{W}/images/logo.png"},
+     f"Check when {W}/images/logo.png was created, without opening it.",
+     f"Periksa kapan {W}/images/logo.png dibuat, tanpa membukanya.",
+     f"Cek kapan {W}/images/logo.png dibuat, gak usah dibuka."),
+    ("direct", "list_allowed_directories", [], {},
+     "Which directories are you allowed to access?", "Direktori mana saja yang boleh kamu akses?",
+     "Directory mana aja yang boleh kamu akses?"),
+    ("confusable", "list_allowed_directories", [], {},
+     "Before doing anything, tell me which folders you have permission to work in.",
+     "Sebelum melakukan apa pun, beri tahu saya folder mana saja yang boleh kamu gunakan.",
+     "Sebelum ngapa-ngapain, kasih tau dulu folder mana aja yang kamu punya permission."),
+    # ===== memory =====
+    ("direct", "create_entities", [], {"entities": [{"name": "Budi"}]},
+     "Remember a new person named Budi who works as a data analyst.",
+     "Ingat orang baru bernama Budi yang bekerja sebagai analis data.",
+     "Remember orang baru namanya Budi, kerjanya data analyst."),
+    ("complex", "create_entities", [], {"entities": [{"name": "Siti"}, {"name": "Proyek Atlas"}]},
+     "Add two new entities to memory: Siti, a person, and Proyek Atlas, a project.",
+     "Tambahkan dua entitas baru ke memori: Siti, seorang individu, dan Proyek Atlas, sebuah proyek.",
+     "Add dua entity baru ke memory: Siti (person) sama Proyek Atlas (project)."),
+    ("confusable", "create_entities", [], {"entities": [{"name": "PT Maju Jaya"}]},
+     "Create a new entity for the company PT Maju Jaya in the knowledge graph.",
+     "Buat entitas baru untuk perusahaan PT Maju Jaya di graf pengetahuan.",
+     "Create entity baru buat company PT Maju Jaya di knowledge graph."),
+    ("direct", "create_relations", [], {"relations": [{"from": "Budi", "to": "Proyek Atlas"}]},
+     "Record that Budi works on Proyek Atlas.", "Catat bahwa Budi mengerjakan Proyek Atlas.",
+     "Catat kalau Budi works on Proyek Atlas."),
+    ("confusable", "create_relations", [], {"relations": [{"from": "Siti", "to": "PT Maju Jaya"}]},
+     "Link Siti to PT Maju Jaya: she is employed by that company.",
+     "Hubungkan Siti dengan PT Maju Jaya: dia bekerja di perusahaan itu.",
+     "Link-in Siti ke PT Maju Jaya, dia employee di company itu."),
+    ("confusable", "create_relations", [], {"relations": [{"from": "Siti", "to": "Proyek Atlas"}]},
+     "Add a connection: Siti manages Proyek Atlas.", "Tambahkan hubungan: Siti mengelola Proyek Atlas.",
+     "Add relation: Siti manage Proyek Atlas."),
+    ("direct", "add_observations", [], {"observations": [{"entityName": "Budi"}]},
+     "Add a note to Budi that he prefers working remotely.",
+     "Tambahkan catatan ke Budi bahwa dia lebih suka bekerja jarak jauh.",
+     "Tambahin note ke Budi kalau dia prefer kerja remote."),
+    ("confusable", "add_observations", [], {"observations": [{"entityName": "Budi"}]},
+     "Budi already exists in memory; also remember that his birthday is 3 March.",
+     "Budi sudah ada di memori; ingat juga bahwa ulang tahunnya 3 Maret.",
+     "Budi udah ada di memory, remember juga birthday-nya 3 Maret."),
+    ("confusable", "add_observations", [], {"observations": [{"entityName": "Proyek Atlas"}]},
+     "Update what we know about Proyek Atlas: the deadline is December 2026.",
+     "Perbarui informasi tentang Proyek Atlas: tenggatnya Desember 2026.",
+     "Update info soal Proyek Atlas: deadline-nya Desember 2026."),
+    ("direct", "delete_entities", [], {"entityNames": ["PT Maju Jaya"]},
+     "Delete the entity PT Maju Jaya from memory completely.",
+     "Hapus entitas PT Maju Jaya dari memori sepenuhnya.",
+     "Delete entity PT Maju Jaya dari memory sampai bersih."),
+    ("confusable", "delete_entities", [], {"entityNames": ["Siti"]},
+     "Forget everything about Siti, including all her connections.",
+     "Lupakan semua hal tentang Siti, termasuk semua hubungannya.",
+     "Forget semua tentang Siti, termasuk semua relation-nya."),
+    ("confusable", "delete_entities", [], {"entityNames": ["Proyek Atlas"]},
+     "Remove Proyek Atlas from the knowledge graph entirely.",
+     "Hapus Proyek Atlas dari graf pengetahuan secara keseluruhan.",
+     "Remove Proyek Atlas dari knowledge graph, totally."),
+    ("direct", "delete_observations", [], {"deletions": [{"entityName": "Budi"}]},
+     "Remove the note 'prefers working remotely' from Budi.",
+     "Hapus catatan 'prefers working remotely' dari Budi.",
+     "Remove note 'prefers working remotely' dari Budi."),
+    ("confusable", "delete_observations", [], {"deletions": [{"entityName": "Budi"}]},
+     "Budi's birthday fact is wrong; delete just that observation and keep Budi.",
+     "Fakta ulang tahun Budi salah; hapus observasi itu saja dan biarkan Budi tetap ada.",
+     "Fact birthday Budi salah, delete observation itu aja, Budi-nya jangan dihapus."),
+    ("confusable", "delete_observations", [], {"deletions": [{"entityName": "Proyek Atlas"}]},
+     "Take the 'deadline is December 2026' note off Proyek Atlas.",
+     "Buang catatan 'deadline is December 2026' dari Proyek Atlas.",
+     "Buang note 'deadline is December 2026' dari Proyek Atlas."),
+    ("direct", "delete_relations", [], {"relations": [{"from": "Budi", "to": "Proyek Atlas"}]},
+     "Remove the relation that Budi works on Proyek Atlas, but keep both entities.",
+     "Hapus relasi bahwa Budi mengerjakan Proyek Atlas, tetapi biarkan kedua entitasnya.",
+     "Remove relation Budi works on Proyek Atlas, tapi dua entity-nya tetap ada."),
+    ("confusable", "delete_relations", [], {"relations": [{"from": "Siti", "to": "PT Maju Jaya"}]},
+     "Siti no longer works at PT Maju Jaya; remove that link.",
+     "Siti tidak lagi bekerja di PT Maju Jaya; hapus hubungan itu.",
+     "Siti udah gak kerja di PT Maju Jaya, hapus link-nya."),
+    ("confusable", "delete_relations", [], {"relations": [{"from": "Siti", "to": "Proyek Atlas"}]},
+     "Unlink Siti from Proyek Atlas, don't delete anyone.",
+     "Putuskan hubungan Siti dengan Proyek Atlas, jangan hapus siapa pun.",
+     "Unlink Siti dari Proyek Atlas, jangan delete siapa-siapa."),
+    ("direct", "read_graph", [], {},
+     "Show me the entire knowledge graph.", "Tampilkan seluruh graf pengetahuan.", "Show seluruh knowledge graph dong."),
+    ("complex", "read_graph", [], {"observationLimit": 0},
+     "Give me a quick overview of everything in memory: just names and types, no observations.",
+     "Berikan gambaran singkat semua isi memori: hanya nama dan jenis, tanpa observasi.",
+     "Kasih overview semua isi memory: nama sama type aja, no observations."),
+    ("complex", "read_graph", ["search_nodes"], {"entityTypes": ["person"]},
+     "List all entities of type person in memory.", "Tampilkan semua entitas bertipe person di memori.",
+     "List semua entity type person di memory."),
+    ("direct", "search_nodes", [], {"query": "marketing"},
+     "Search memory for anything related to 'marketing'.",
+     "Cari di memori apa saja yang berkaitan dengan 'marketing'.",
+     "Search di memory apa aja yang related sama 'marketing'."),
+    ("confusable", "search_nodes", [], {"query": "Python"},
+     "Who in memory has something to do with Python? I don't know their names.",
+     "Siapa di memori yang ada hubungannya dengan Python? Saya tidak tahu nama mereka.",
+     "Siapa di memory yang ada hubungannya sama Python? Aku gak tau nama-namanya."),
+    ("complex", "search_nodes", [], {"query": "Bandung", "limit": 3},
+     "Find at most 3 entities mentioning 'Bandung'.", "Cari maksimal 3 entitas yang menyebut 'Bandung'.",
+     "Find maksimal 3 entity yang mention 'Bandung'."),
+    ("direct", "open_nodes", [], {"names": ["Budi", "Siti"]},
+     "Open the entities Budi and Siti.", "Buka entitas Budi dan Siti.", "Open entity Budi sama Siti."),
+    ("confusable", "open_nodes", ["search_nodes"], {"names": ["Proyek Atlas"]},
+     "Show me everything stored about Proyek Atlas.", "Tampilkan semua yang tersimpan tentang Proyek Atlas.",
+     "Show semua yang ke-save soal Proyek Atlas."),
+    ("confusable", "open_nodes", [], {"names": ["PT Maju Jaya"]},
+     "Look up the entity named exactly 'PT Maju Jaya'.", "Cari entitas yang namanya persis 'PT Maju Jaya'.",
+     "Look up entity yang namanya exactly 'PT Maju Jaya'."),
+    # ===== git =====
+    ("direct", "git_status", [], {"repo_path": R},
+     f"What's the status of the git repository at {R}?", f"Bagaimana status repositori git di {R}?",
+     f"Status git repo di {R} gimana?"),
+    ("confusable", "git_status", [], {"repo_path": R},
+     f"Which files have I modified in {R}? Just the list, not the changes.",
+     f"File mana saja yang sudah saya ubah di {R}? Cukup daftarnya, bukan isi perubahannya.",
+     f"File apa aja yang udah aku modify di {R}? List-nya aja, bukan changes-nya."),
+    ("confusable", "git_status", [], {"repo_path": R},
+     f"Is my working tree in {R} clean?", f"Apakah working tree saya di {R} bersih?",
+     f"Working tree aku di {R} udah clean belum?"),
+    ("direct", "git_diff_unstaged", [], {"repo_path": R},
+     f"Show the changes in {R} that I haven't staged yet.", f"Tampilkan perubahan di {R} yang belum saya stage.",
+     f"Show changes di {R} yang belum aku stage."),
+    ("confusable", "git_diff_unstaged", [], {"repo_path": R},
+     f"What did I change in {R} since my last git add?", f"Apa yang saya ubah di {R} sejak git add terakhir?",
+     f"Apa aja yang aku ubah di {R} sejak last git add?"),
+    ("complex", "git_diff_unstaged", [], {"repo_path": R, "context_lines": 10},
+     f"Show the unstaged diff in {R} with 10 lines of context.",
+     f"Tampilkan diff yang belum di-stage di {R} dengan 10 baris konteks.",
+     f"Show unstaged diff di {R} pakai 10 lines context."),
+    ("direct", "git_diff_staged", [], {"repo_path": R},
+     f"Show the changes I've staged for commit in {R}.",
+     f"Tampilkan perubahan yang sudah saya stage untuk commit di {R}.",
+     f"Show changes yang udah aku stage buat commit di {R}."),
+    ("confusable", "git_diff_staged", [], {"repo_path": R},
+     f"Before I commit in {R}, show me exactly what will go into the commit.",
+     f"Sebelum saya commit di {R}, tampilkan persis apa saja yang akan masuk ke commit.",
+     f"Sebelum commit di {R}, show dulu exactly apa yang bakal masuk ke commit."),
+    ("confusable", "git_diff_staged", [], {"repo_path": R},
+     f"Review the staged changes in {R}.", f"Tinjau perubahan yang sudah di-stage di {R}.",
+     f"Review staged changes di {R} dong."),
+    ("direct", "git_diff", [], {"repo_path": R, "target": {"any_of": ["main..feature-login", "main...feature-login"]}},
+     f"Show the differences between the main branch and the feature-login branch in {R}.",
+     f"Tampilkan perbedaan antara branch main dan branch feature-login di {R}.",
+     f"Show difference antara branch main sama feature-login di {R}."),
+    ("confusable", "git_diff", [], {"repo_path": R, "target": "develop"},
+     f"Compare my current code in {R} against the develop branch.",
+     f"Bandingkan kode saya saat ini di {R} dengan branch develop.",
+     f"Compare code aku yang sekarang di {R} sama branch develop."),
+    ("complex", "git_diff", [], {"repo_path": R, "target": {"any_of": ["a1b2c3d..HEAD", "a1b2c3d"]}},
+     f"Show what changed between commit a1b2c3d and HEAD in {R}.",
+     f"Tampilkan apa yang berubah antara commit a1b2c3d dan HEAD di {R}.",
+     f"Show apa yang changed antara commit a1b2c3d dan HEAD di {R}."),
+    ("direct", "git_commit", [], {"repo_path": R, "message": "Fix login bug"},
+     f"Commit the staged changes in {R} with the message 'Fix login bug'.",
+     f"Commit perubahan yang sudah di-stage di {R} dengan pesan 'Fix login bug'.",
+     f"Commit staged changes di {R}, message-nya 'Fix login bug'."),
+    ("confusable", "git_commit", [], {"repo_path": R, "message": "Add README"},
+     f"Save my staged work in {R} as a commit called 'Add README'.",
+     f"Simpan pekerjaan yang sudah di-stage di {R} sebagai commit bernama 'Add README'.",
+     f"Save staged work aku di {R} jadi commit 'Add README'."),
+    ("direct", "git_commit", [], {"repo_path": R, "message": "Update dependencies"},
+     f"Record the staged changes in {R}: 'Update dependencies'.",
+     f"Rekam perubahan yang sudah di-stage di {R}: 'Update dependencies'.",
+     f"Record staged changes di {R}: 'Update dependencies'."),
+    ("direct", "git_add", [], {"repo_path": R, "files": ["src/app.py"]},
+     f"Stage the file src/app.py in {R}.", f"Stage file src/app.py di {R}.", f"Stage file src/app.py di {R} dong."),
+    ("complex", "git_add", [], {"repo_path": R, "files": ["README.md", "setup.py"]},
+     f"Add README.md and setup.py to the staging area in {R}.",
+     f"Tambahkan README.md dan setup.py ke staging area di {R}.",
+     f"Add README.md sama setup.py ke staging area di {R}."),
+    ("confusable", "git_add", [], {"repo_path": R, "files": ["docs/guide.md"]},
+     f"Prepare docs/guide.md in {R} so it's included in the next commit.",
+     f"Siapkan docs/guide.md di {R} supaya ikut masuk ke commit berikutnya.",
+     f"Siapin docs/guide.md di {R} biar masuk ke next commit."),
+    ("direct", "git_reset", [], {"repo_path": R},
+     f"Unstage everything in {R}.", f"Batalkan stage semua perubahan di {R}.", f"Unstage semua di {R}."),
+    ("confusable", "git_reset", [], {"repo_path": R},
+     f"I staged the wrong files in {R}; take them all out of the staging area but keep my edits.",
+     f"Saya salah stage file di {R}; keluarkan semuanya dari staging area, tetapi jangan hapus editan saya.",
+     f"Aku salah stage file di {R}, keluarin semua dari staging area tapi edit-an aku jangan hilang."),
+    ("confusable", "git_reset", [], {"repo_path": R},
+     f"Clear the staging area of {R}.", f"Kosongkan staging area di {R}.", f"Clear staging area di {R} ya."),
+    ("direct", "git_log", [], {"repo_path": R},
+     f"Show the commit history of {R}.", f"Tampilkan riwayat commit di {R}.", f"Show commit history di {R}."),
+    ("complex", "git_log", [], {"repo_path": R, "max_count": 5},
+     f"Show the last 5 commits in {R}.", f"Tampilkan 5 commit terakhir di {R}.", f"Show last 5 commits di {R}."),
+    ("complex", "git_log", [], {"repo_path": R, "start_timestamp": {"any_of": ["2026-11-01", "2026-11-01T00:00:00"]}},
+     f"List the commits made in {R} since 2026-11-01.", f"Tampilkan commit yang dibuat di {R} sejak 2026-11-01.",
+     f"List commit di {R} since 2026-11-01."),
+    ("complex", "git_log", [], {"repo_path": R,
+                                "start_timestamp": {"any_of": ["2026-10-01", "2026-10-01T00:00:00"]},
+                                "end_timestamp": {"any_of": ["2026-10-31", "2026-10-31T23:59:59", "2026-10-31T00:00:00"]}},
+     f"What was committed in {R} between 2026-10-01 and 2026-10-31?",
+     f"Apa saja yang di-commit di {R} antara 2026-10-01 dan 2026-10-31?",
+     f"Apa aja yang di-commit di {R} antara 2026-10-01 sampai 2026-10-31?"),
+    ("direct", "git_create_branch", [], {"repo_path": R, "branch_name": "feature-payment"},
+     f"Create a new branch called feature-payment in {R}.", f"Buat branch baru bernama feature-payment di {R}.",
+     f"Bikin new branch feature-payment di {R}."),
+    ("complex", "git_create_branch", [], {"repo_path": R, "branch_name": "hotfix-1", "base_branch": "main"},
+     f"Create a branch hotfix-1 from the main branch in {R}.", f"Buat branch hotfix-1 dari branch main di {R}.",
+     f"Create branch hotfix-1 dari main di {R}."),
+    ("confusable", "git_create_branch", [], {"repo_path": R, "branch_name": "experiment-ui"},
+     f"Start a new branch named experiment-ui in {R} but stay on the current one.",
+     f"Mulai branch baru bernama experiment-ui di {R}, tetapi tetap di branch yang sekarang.",
+     f"Start branch baru experiment-ui di {R}, tapi tetap stay di branch yang sekarang."),
+    ("direct", "git_checkout", [], {"repo_path": R, "branch_name": "develop"},
+     f"Switch to the develop branch in {R}.", f"Pindah ke branch develop di {R}.", f"Switch ke branch develop di {R}."),
+    ("confusable", "git_checkout", [], {"repo_path": R, "branch_name": "feature-login"},
+     f"I want to work on feature-login now in {R}; move me to that branch.",
+     f"Saya mau mengerjakan feature-login sekarang di {R}; pindahkan saya ke branch itu.",
+     f"Aku mau kerja di feature-login sekarang di {R}, pindahin ke branch itu."),
+    ("confusable", "git_checkout", [], {"repo_path": R, "branch_name": "main"},
+     f"Go back to main in {R}.", f"Kembali ke main di {R}.", f"Balik ke main di {R}."),
+    ("direct", "git_merge", [], {"repo_path": R, "source_branch": "feature-login"},
+     f"Merge the feature-login branch into the current branch in {R}.",
+     f"Gabungkan branch feature-login ke branch saat ini di {R}.",
+     f"Merge branch feature-login ke current branch di {R}."),
+    ("complex", "git_merge", [], {"repo_path": R, "source_branch": "develop", "fast_forward_only": False},
+     f"Merge develop into the current branch of {R}, and allow a merge commit if needed.",
+     f"Gabungkan develop ke branch saat ini di {R}, dan izinkan merge commit jika perlu.",
+     f"Merge develop ke current branch di {R}, boleh bikin merge commit kalau perlu."),
+    ("confusable", "git_merge", [], {"repo_path": R, "source_branch": "hotfix-1"},
+     f"Bring the changes from hotfix-1 into my current branch in {R}.",
+     f"Bawa perubahan dari hotfix-1 ke branch saya saat ini di {R}.",
+     f"Bawa changes dari hotfix-1 ke branch aku yang sekarang di {R}."),
+    ("direct", "git_show", [], {"repo_path": R, "revision": "a1b2c3d"},
+     f"Show the details of commit a1b2c3d in {R}.", f"Tampilkan detail commit a1b2c3d di {R}.",
+     f"Show detail commit a1b2c3d di {R}."),
+    ("confusable", "git_show", [], {"repo_path": R, "revision": "HEAD"},
+     f"What did the latest commit in {R} change?", f"Apa yang diubah oleh commit terbaru di {R}?",
+     f"Latest commit di {R} ngubah apa aja?"),
+    ("complex", "git_show", [], {"repo_path": R, "revision": "a1b2c3d:config.yaml"},
+     f"Show the version of config.yaml as it was in commit a1b2c3d in {R}.",
+     f"Tampilkan versi config.yaml seperti pada commit a1b2c3d di {R}.",
+     f"Show versi config.yaml waktu di commit a1b2c3d di {R}."),
+    ("direct", "git_branch", [], {"repo_path": R, "branch_type": "local"},
+     f"List all local branches in {R}.", f"Tampilkan semua branch lokal di {R}.", f"List semua local branch di {R}."),
+    ("complex", "git_branch", [], {"repo_path": R, "branch_type": "all"},
+     f"Show every branch in {R}, local and remote.", f"Tampilkan semua branch di {R}, baik lokal maupun remote.",
+     f"Show semua branch di {R}, local plus remote."),
+    ("complex", "git_branch", [], {"repo_path": R, "contains": "a1b2c3d"},
+     f"Which branches in {R} contain commit a1b2c3d?", f"Branch mana saja di {R} yang memuat commit a1b2c3d?",
+     f"Branch apa aja di {R} yang contain commit a1b2c3d?"),
+    ("direct", "git_remote", [], {"repo_path": R},
+     f"Show the remotes configured for {R}.", f"Tampilkan remote yang dikonfigurasi untuk {R}.",
+     f"Show remote yang di-setup buat {R}."),
+    ("confusable", "git_remote", [], {"repo_path": R},
+     f"What's the push URL of the repository at {R}?", f"Apa URL push dari repositori di {R}?",
+     f"Push URL repo di {R} apa?"),
+    ("confusable", "git_remote", [], {"repo_path": R},
+     f"Where is {R} hosted? Show me its origin URL.", f"Di mana {R} di-hosting? Tampilkan URL origin-nya.",
+     f"{R} di-host di mana? Show origin URL-nya."),
+    # ===== fetch =====
+    ("direct", "fetch", [], {"url": "https://example.com/news"},
+     "Fetch the page https://example.com/news.", "Ambil halaman https://example.com/news.",
+     "Fetch page https://example.com/news dong."),
+    ("confusable", "fetch", [], {"url": "https://docs.python.org/3/whatsnew/"},
+     "What does https://docs.python.org/3/whatsnew/ say? Summarize it.",
+     "Apa isi https://docs.python.org/3/whatsnew/? Ringkas isinya.",
+     "https://docs.python.org/3/whatsnew/ isinya apa? Summarize ya."),
+    ("complex", "fetch", [], {"url": "https://example.com", "raw": True},
+     "Get the raw HTML of https://example.com.", "Ambil HTML mentah dari https://example.com.",
+     "Ambil raw HTML dari https://example.com."),
+    ("complex", "fetch", [], {"url": "https://example.com/article", "max_length": 2000},
+     "Fetch https://example.com/article but return only the first 2000 characters.",
+     "Ambil https://example.com/article, tetapi kembalikan hanya 2000 karakter pertama.",
+     "Fetch https://example.com/article, tapi return 2000 characters pertama aja."),
+    ("complex", "fetch", [], {"url": "https://example.com/article", "start_index": 5000},
+     "The previous fetch of https://example.com/article was cut off at character 5000; continue from there.",
+     "Pengambilan sebelumnya dari https://example.com/article terpotong di karakter 5000; lanjutkan dari situ.",
+     "Fetch sebelumnya dari https://example.com/article ke-cut di character 5000, lanjutin dari situ."),
+    ("confusable", "fetch", [], {"url": "https://api.example.com/rates"},
+     "Download the latest exchange rates from https://api.example.com/rates.",
+     "Unduh kurs terbaru dari https://api.example.com/rates.",
+     "Download exchange rate terbaru dari https://api.example.com/rates."),
+    # ===== time =====
+    ("direct", "get_current_time", [], {"timezone": "Asia/Tokyo"},
+     "What time is it now in Tokyo?", "Jam berapa sekarang di Tokyo?", "Current time di Tokyo jam berapa?"),
+    ("direct", "get_current_time", [], {"timezone": "Europe/London"},
+     "What's the current time in London?", "Pukul berapa sekarang di London?", "Current time di London sekarang berapa?"),
+    ("confusable", "get_current_time", [], {"timezone": "America/New_York"},
+     "What's today's date in New York?", "Tanggal berapa hari ini di New York?", "Today di New York tanggal berapa?"),
+    ("confusable", "get_current_time", [], {"timezone": "Australia/Sydney"},
+     "Is it already evening in Sydney?", "Apakah di Sydney sudah malam?", "Di Sydney udah evening belum?"),
+    ("direct", "convert_time", [], {"source_timezone": JKT, "time": "15:00", "target_timezone": "Asia/Tokyo"},
+     "Convert 15:00 Jakarta time to Tokyo time.", "Konversikan pukul 15:00 waktu Jakarta ke waktu Tokyo.",
+     "Convert jam 15:00 waktu Jakarta ke Tokyo time."),
+    ("complex", "convert_time", [], {"source_timezone": "Europe/London", "time": "09:30", "target_timezone": JKT},
+     "If it's 09:30 in London, what time is it in Jakarta?", "Kalau pukul 09:30 di London, jam berapa di Jakarta?",
+     "Kalau jam 09:30 di London, di Jakarta jam berapa?"),
+    ("complex", "convert_time", [], {"source_timezone": "America/New_York", "time": "20:00", "target_timezone": JKT},
+     "I have a meeting at 20:00 New York time. What time is that in Bandung?",
+     "Saya ada rapat pukul 20:00 waktu New York. Itu jam berapa di Bandung?",
+     "Aku ada meeting jam 20:00 waktu New York. Itu jam berapa di Bandung?"),
+    ("confusable", "convert_time", [], {"source_timezone": "America/Los_Angeles", "time": "08:00",
+                                        "target_timezone": "Asia/Singapore"},
+     "What's 8 AM in Los Angeles in Singapore time?", "Jam 8 pagi di Los Angeles itu jam berapa di Singapura?",
+     "Jam 8 AM di Los Angeles itu jam berapa di Singapore?"),
+    ("direct", "get_time_ago", [], {"timezone": JKT, "hours_ago": 3},
+     "What was the time 3 hours ago in Jakarta?", "Jam berapa 3 jam yang lalu di Jakarta?",
+     "3 hours ago di Jakarta itu jam berapa?"),
+    ("complex", "get_time_ago", [], {"timezone": "Europe/London", "days_ago": 2, "hours_ago": 6},
+     "What was the date and time exactly 2 days and 6 hours ago in London?",
+     "Tanggal dan jam berapa tepat 2 hari 6 jam yang lalu di London?",
+     "Tanggal sama jam berapa exactly 2 hari 6 jam yang lalu di London?"),
+    ("confusable", "get_time_ago", [], {"timezone": JKT, "days_ago": 10},
+     "What day was it 10 days ago?", "Hari apa 10 hari yang lalu?", "10 days ago itu hari apa?"),
+    ("complex", "get_time_ago", [], {"timezone": "Asia/Tokyo", "minutes_ago": 45},
+     "What time was it 45 minutes ago in Tokyo?", "Jam berapa 45 menit yang lalu di Tokyo?",
+     "45 minutes ago di Tokyo jam berapa?"),
+    # ===== kueri tambahan lintas server (pengecoh) =====
+    ("confusable", "search_nodes", [], {},
+     "Find where I saved notes about the client meeting in my memory graph.",
+     "Cari di graf memori saya catatan tentang rapat dengan klien.",
+     "Cari di memory graph aku notes soal client meeting."),
+    ("confusable", "search_files", [], {"path": W, "pattern": {"any_of": ["**/*meeting*", "*meeting*"]}},
+     f"Search the files in {W} for anything named 'meeting'.",
+     f"Cari file di {W} yang namanya mengandung 'meeting'.",
+     f"Search file di {W} yang namanya ada 'meeting'-nya."),
+    ("confusable", "read_text_file", RT, {"path": f"{W}/logs/app.log"},
+     f"Read the application log at {W}/logs/app.log.", f"Baca log aplikasi di {W}/logs/app.log.",
+     f"Read app log di {W}/logs/app.log."),
+    ("confusable", "write_file", [], {"path": f"{W}/memo.txt", "content": "Server down at 10:00"},
+     f"Save a note in a file {W}/memo.txt that says 'Server down at 10:00'.",
+     f"Simpan catatan di file {W}/memo.txt yang berbunyi 'Server down at 10:00'.",
+     f"Save note di file {W}/memo.txt isinya 'Server down at 10:00'."),
+    ("confusable", "add_observations", [], {"observations": [{"entityName": "Server Produksi"}]},
+     "Remember that the server went down at 10:00 by adding it to the entity Server Produksi in memory.",
+     "Ingat bahwa server mati pukul 10:00 dengan menambahkannya ke entitas Server Produksi di memori.",
+     "Remember kalau server down jam 10:00, tambahin ke entity Server Produksi di memory."),
+    ("confusable", "git_log", [], {"repo_path": R},
+     f"Show me the history of changes to the repository in {R} over the last week.",
+     f"Tampilkan riwayat perubahan repositori di {R} selama seminggu terakhir.",
+     f"Show history changes repo di {R} selama last week."),
+    ("confusable", "create_directory", [], {"path": f"{W}/projects/atlas"},
+     f"Create a folder for the new project at {W}/projects/atlas and nothing else.",
+     f"Buat folder untuk proyek baru di {W}/projects/atlas, itu saja.",
+     f"Bikin folder buat project baru di {W}/projects/atlas, that's it."),
+    ("confusable", "search_files", [], {"path": R, "pattern": "**/.env"},
+     f"Is there a file called .env anywhere in {R}?", f"Apakah ada file bernama .env di mana pun di {R}?",
+     f"Ada file .env gak di mana pun di {R}?"),
+    ("confusable", "list_directory_with_sizes", [], {"path": f"{W}/archive"},
+     f"Show me the contents of the folder {W}/archive and how big each item is.",
+     f"Tampilkan isi folder {W}/archive dan seberapa besar setiap item.",
+     f"Show isi folder {W}/archive plus seberapa gede tiap item."),
+    ("confusable", "git_status", ["git_branch"], {"repo_path": R},
+     f"What branch am I on in {R}?", f"Saya sedang berada di branch apa di {R}?", f"Aku lagi di branch apa sih di {R}?"),
+    ("complex", "write_file", [], {"path": f"{W}/data/header.csv", "content": "id,name,price"},
+     f"Write a file {W}/data/header.csv with the line 'id,name,price'.",
+     f"Tulis file {W}/data/header.csv berisi baris 'id,name,price'.",
+     f"Write file {W}/data/header.csv isinya line 'id,name,price'."),
+    ("complex", "edit_file", [], {"path": f"{R}/README.md", "edits": [{"oldText": "Version 1", "newText": "Version 2"},
+                                                                     {"oldText": "Draft", "newText": "Final"}]},
+     f"In {R}/README.md, replace 'Version 1' with 'Version 2' and 'Draft' with 'Final'.",
+     f"Di {R}/README.md, ganti 'Version 1' dengan 'Version 2' dan 'Draft' dengan 'Final'.",
+     f"Di {R}/README.md, replace 'Version 1' jadi 'Version 2' sama 'Draft' jadi 'Final'."),
+    ("complex", "add_observations", [], {"observations": [{"entityName": "Siti"}]},
+     "Add the observations 'speaks Japanese' and 'joined in 2024' to Siti.",
+     "Tambahkan observasi 'speaks Japanese' dan 'joined in 2024' ke Siti.",
+     "Add observation 'speaks Japanese' sama 'joined in 2024' ke Siti."),
+    ("confusable", "get_current_time", [], {"timezone": JKT},
+     "What time is it right now?", "Sekarang jam berapa?", "Right now jam berapa ya?"),
+]
+
+
+def sha(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+if sha(SNAPSHOT) != EXPECTED_SHA256["tools_en.json"]:
+    sys.exit("tools_en.json berbeda dari snapshot yang dipakai saat validasi")
+snap = json.load(open(SNAPSHOT, encoding="utf-8"))
+tool_server = {t["name"]: s["server"] for s in snap["servers"] for t in s["tools"]}
+
+tools_id, used = copy.deepcopy(snap), set()
+for s in tools_id["servers"]:
+    for t in s["tools"]:
+        for pname, obj in [("", t)] + list(t.get("inputSchema", {}).get("properties", {}).items()):
+            if obj.get("description", ""):
+                key = f"{t['name']}|{pname}"
+                obj["description"] = ID[key]
+                used.add(key)
+assert used == set(ID), sorted(set(ID) ^ used)
+
+queries = [{"id": f"q{i:03d}", "category": cat, "server": tool_server[tool], "gold_tool": tool,
+            "lenient_alt_tools": alts, "gold_params": params, "query_en": en, "query_id": id_, "query_mix": mix}
+           for i, (cat, tool, alts, params, en, id_, mix) in enumerate(Q, 1)]
+
+os.makedirs(OUT, exist_ok=True)
+with open(f"{OUT}/tools_id.json", "w", encoding="utf-8", newline="\n") as f:
+    f.write(json.dumps(tools_id, ensure_ascii=False, indent=2))
+with open(f"{OUT}/queries.json", "w", encoding="utf-8", newline="\n") as f:
+    f.write(json.dumps({"context": {"workspace_dir": WORKSPACE, "git_repo": REPO, "local_timezone": "Asia/Jakarta"},
+                        "queries": queries}, ensure_ascii=False, indent=2))
+shutil.copyfile(SNAPSHOT, f"{OUT}/tools_en.json")
+
+got = {n: sha(f"{OUT}/{n}") for n in EXPECTED_SHA256}
+if got != EXPECTED_SHA256:
+    sys.exit(f"Hash tidak cocok dengan dataset tervalidasi: {got}")
+
+manifest = {"validator": "Indah Pratiwi Hutahaean", "validated_on": "2026-11-17", "corrections": 0,
+            "source_snapshot": "mcp-tool-snapshot v2 / tools_en.json",
+            "sha256": {"tools_id.json": got["tools_id.json"], "queries.json": got["queries.json"]}}
+with open(f"{OUT}/dataset_manifest.json", "w", encoding="utf-8", newline="\n") as f:
+    json.dump(manifest, f, indent=2)
+print(f"OK: {len(ID)} terjemahan, {len(queries)} kueri, hash cocok")

@@ -1,0 +1,23 @@
+{
+    "machine_shape":  "NvidiaTeslaT4",
+    "id":  "matthew10101/mcp-tool-qwen3-8b",
+    "enable_internet":  true,
+    "title":  "MCP Tool Qwen3 8B",
+    "kernel_type":  "script",
+    "model_sources":  [
+
+                      ],
+    "is_private":  true,
+    "dataset_sources":  [
+                            "matthew10101/mcp-tool-selection-indonesian"
+                        ],
+    "language":  "python",
+    "competition_sources":  [
+
+                            ],
+    "enable_gpu":  true,
+    "code_file":  "experiment.py",
+    "kernel_sources":  [
+
+                       ]
+}

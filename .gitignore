@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+dataset_downloaded/
+experiments/
+analysis/
+*.log
+*.zip

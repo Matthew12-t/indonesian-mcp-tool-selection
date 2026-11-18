@@ -1,0 +1,10 @@
+model,query_language,id_minus_en_accuracy,ci95_low,ci95_high,n_query_clusters
+qwen3_8b,en,-0.013333333333333334,-0.04,0.013333,150
+qwen3_8b,id,0.013333333333333334,-0.02,0.046667,150
+qwen3_8b,mix,0.02,0.0,0.046667,150
+llama3.1_8b,en,-0.04,-0.086667,0.006667,150
+llama3.1_8b,id,-0.02,-0.06,0.02,150
+llama3.1_8b,mix,-0.05333333333333334,-0.106667,0.0,150
+mistral_7b,en,0.0,0.0,0.0,150
+mistral_7b,id,0.0,0.0,0.0,150
+mistral_7b,mix,0.0,0.0,0.0,150
