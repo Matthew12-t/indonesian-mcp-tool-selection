@@ -10,12 +10,12 @@ The experiment compares English and Indonesian tool descriptions against English
 - `notebooks/00_build_dataset.py`, `00a_translations.py`, `00b_build_dataset.py`: construct and verify the translated tool catalog and paired requests.
 - `notebooks/mcp-tool-*/experiment.py`: exact model-specific Kaggle scripts used for the completed runs; the adjacent metadata files record their Kaggle configuration.
 - `notebooks/02_experiment.py`: common experiment source.
-- `notebooks/03_analyze_results.py`: validate downloaded input and run hashes, require exactly 2,700 unique calls per model, and write aggregate and paired summaries.
+- `notebooks/03_analyze_results.py`: validate downloaded input and run hashes, require exactly 2,700 unique calls per model, and write aggregate, paired, server, outcome, repeat-consistency, and confusion summaries.
 - `results/`: aggregate CSV files produced from the completed, downloaded Kaggle outputs.
 
 ## Results
 
-All three runs completed with 2,700 calls each and no recorded API errors. Mean strict tool-selection accuracy across six language conditions was **87.4%** for Qwen3 8B, **88.1%** for Llama 3.1 8B, and **0.0%** for Mistral 7B. Mistral returned ordinary text, often mentioning a tool, but did not produce a structured tool call in any of its 2,700 responses under this setup. The CSV files contain the condition-level results and task-cluster bootstrap contrasts.
+All three runs completed with 2,700 calls each and no recorded API errors. Mean strict tool-selection accuracy across six language conditions was **87.4%** for Qwen3 8B, **88.1%** for Llama 3.1 8B, and **0.0%** for Mistral 7B. Mistral returned ordinary text, often mentioning a tool, but did not produce a structured tool call in any of its 2,700 responses under this setup. The CSV files contain condition-level results, task-cluster bootstrap contrasts, per-server diagnostics, mutually exclusive first-call outcomes, repeat consistency, and frequent wrong-tool pairs.
 
 ## Reproducing the analysis
 

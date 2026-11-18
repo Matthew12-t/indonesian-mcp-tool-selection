@@ -11,7 +11,7 @@ import json
 import pathlib
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 MODELS = ("qwen3_8b", "llama3.1_8b", "mistral_7b")
@@ -165,7 +165,70 @@ def main():
         writer = csv.DictWriter(f, fieldnames=list(language_effects[0]))
         writer.writeheader()
         writer.writerows(language_effects)
-    print(f"Verified {len(all_records)} Kaggle responses; wrote summaries and paired effects to {out}")
+    server_summary = []
+    outcome_summary = []
+    repeat_consistency = []
+    wrong_tool_pairs = []
+    for model in MODELS:
+        model_rows = [r for (m, *_), r in all_records.items() if m == model]
+        pair_counts = Counter((r["gold_tool"], r["first_tool"]) for r in model_rows
+                              if r["first_tool"] is not None and not r["tool_correct"])
+        wrong_tool_pairs.extend({"model": model, "gold_tool": gold, "selected_tool": selected,
+                                 "n": count}
+                                for (gold, selected), count in sorted(
+                                    pair_counts.items(), key=lambda item: (-item[1], item[0])))
+        for server in ("filesystem", "git", "memory", "time", "fetch"):
+            rows = [r for r in model_rows if by_id[r["qid"]]["server"] == server]
+            server_summary.append({
+                "model": model, "server": server, "n": len(rows),
+                "tool_accuracy": sum(r["tool_correct"] for r in rows) / len(rows),
+                "joint_accuracy": sum(r["joint_correct"] for r in rows) / len(rows),
+                "no_tool_rate": sum(r["first_tool"] is None for r in rows) / len(rows),
+            })
+        outcomes = defaultdict(int)
+        for r in model_rows:
+            if r["error"]:
+                outcomes["api_error"] += 1
+            elif r["first_tool"] is None:
+                outcomes["no_call"] += 1
+            elif not r["tool_correct"]:
+                outcomes["wrong_tool"] += 1
+            elif not r["params_correct"]:
+                outcomes["correct_tool_wrong_args"] += 1
+            else:
+                outcomes["joint_correct"] += 1
+        assert sum(outcomes.values()) == 2700
+        outcome_summary.append({"model": model, "n": 2700, **{
+            k: outcomes[k] for k in ("api_error", "no_call", "wrong_tool",
+                                  "correct_tool_wrong_args", "joint_correct")}})
+        for dl in DESC:
+            for ql in LANG:
+                clusters = [[all_records[model, rep, dl, ql, qid] for rep in REPS]
+                            for qid in by_id]
+                repeat_consistency.append({
+                    "model": model, "description_language": dl, "query_language": ql,
+                    "n_query_clusters": len(clusters),
+                    "same_first_tool_rate": sum(len({r["first_tool"] for r in c}) == 1
+                                                for c in clusters) / len(clusters),
+                    "same_first_args_rate": sum(len({json.dumps(r["first_args"], sort_keys=True)
+                                                    for r in c}) == 1
+                                                for c in clusters) / len(clusters),
+                    "same_correctness_rate": sum(len({r["tool_correct"] for r in c}) == 1
+                                                 for c in clusters) / len(clusters),
+                    "all_three_correct_rate": sum(all(r["tool_correct"] for r in c)
+                                                  for c in clusters) / len(clusters),
+                    "any_correct_rate": sum(any(r["tool_correct"] for r in c)
+                                            for c in clusters) / len(clusters),
+                })
+    for filename, rows in (("server_summary.csv", server_summary),
+                           ("outcome_summary.csv", outcome_summary),
+                           ("repeat_consistency.csv", repeat_consistency),
+                           ("wrong_tool_pairs.csv", wrong_tool_pairs)):
+        with (out / filename).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    print(f"Verified {len(all_records)} Kaggle responses; wrote summaries and diagnostics to {out}")
 
 
 if __name__ == "__main__":

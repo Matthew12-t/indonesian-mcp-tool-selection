@@ -1,0 +1,4 @@
+model,n,api_error,no_call,wrong_tool,correct_tool_wrong_args,joint_correct
+qwen3_8b,2700,0,105,234,255,2106
+llama3.1_8b,2700,0,27,294,885,1494
+mistral_7b,2700,0,2700,0,0,0
